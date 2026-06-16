@@ -18,12 +18,13 @@ function combineSignals(a, b) {
   const controller = new AbortController();
   if (a.aborted || b.aborted) {
     controller.abort();
-    return controller.signal;
+    return [controller.signal, () => {
+    }];
   }
   const abort = () => controller.abort();
   a.addEventListener("abort", abort, { once: true });
   b.addEventListener("abort", abort, { once: true });
-  return controller.signal;
+  return [controller.signal, () => b.removeEventListener("abort", abort)];
 }
 var HttpClient = class {
   baseUrl;
@@ -37,7 +38,8 @@ var HttpClient = class {
   async request(method, path, body, signal) {
     const timeoutController = new AbortController();
     const timeoutId = setTimeout(() => timeoutController.abort(), this.timeout);
-    const combined = signal ? combineSignals(timeoutController.signal, signal) : timeoutController.signal;
+    const [combined, cleanupSignal] = signal ? combineSignals(timeoutController.signal, signal) : [timeoutController.signal, () => {
+    }];
     try {
       const res = await fetch(`${this.baseUrl}${path}`, {
         method,
@@ -62,6 +64,7 @@ var HttpClient = class {
       return data;
     } finally {
       clearTimeout(timeoutId);
+      cleanupSignal();
     }
   }
   get(path, signal) {
@@ -102,6 +105,11 @@ var Worker = class {
   activeCount = 0;
   abortController = null;
   /**
+   * Mensagens recebidas no último poll mas ainda não despachadas por falta de slot.
+   * Drenadas antes de qualquer novo round trip de rede.
+   */
+  messageBuffer = [];
+  /**
    * Fila de resolvers pendentes de `waitForSlot`.
    * Cada entry é resolvida quando um slot de concorrência libera (ou em stop()).
    */
@@ -131,6 +139,7 @@ var Worker = class {
   async stop() {
     if (!this.running) return;
     this.running = false;
+    this.messageBuffer.length = 0;
     this.abortController?.abort();
     for (const resolve of this.slotWaiters) resolve();
     this.slotWaiters = [];
@@ -142,15 +151,18 @@ var Worker = class {
   async loop() {
     const signal = this.abortController.signal;
     while (this.running) {
-      const available = this.concurrency - this.activeCount;
-      if (available <= 0) {
+      while (this.messageBuffer.length > 0 && this.activeCount < this.concurrency) {
+        if (!this.running) return;
+        this.activeCount++;
+        void this.dispatch(this.messageBuffer.shift());
+      }
+      if (this.activeCount >= this.concurrency) {
         await this.waitForSlot().catch(() => {
         });
         continue;
       }
-      const maxMessages = Math.min(available, this.maxNumberOfMessages);
       const qs = new URLSearchParams({
-        maxNumberOfMessages: String(maxMessages),
+        maxNumberOfMessages: String(this.maxNumberOfMessages),
         waitTimeSeconds: String(this.waitTimeSeconds)
       });
       try {
@@ -160,8 +172,12 @@ var Worker = class {
         );
         for (const msg of messages) {
           if (!this.running) break;
-          this.activeCount++;
-          void this.dispatch(msg);
+          if (this.activeCount < this.concurrency) {
+            this.activeCount++;
+            void this.dispatch(msg);
+          } else {
+            this.messageBuffer.push(msg);
+          }
         }
       } catch (err) {
         if (!this.running) break;

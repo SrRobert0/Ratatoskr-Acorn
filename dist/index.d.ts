@@ -48,8 +48,8 @@ interface SubscribeOptions {
     waitTimeSeconds?: number;
     /**
      * Quantas mensagens buscar por poll (1–10).
-     * O worker nunca busca mais do que os slots livres disponíveis.
-     * Default: igual ao `concurrency`.
+     * Mensagens que excedam os slots livres são bufferizadas e despachadas
+     * sem round trip adicional conforme os slots abrem. Default: igual ao `concurrency`.
      */
     maxNumberOfMessages?: number;
     /**
@@ -87,6 +87,11 @@ declare class Worker {
     private running;
     private activeCount;
     private abortController;
+    /**
+     * Mensagens recebidas no último poll mas ainda não despachadas por falta de slot.
+     * Drenadas antes de qualquer novo round trip de rede.
+     */
+    private messageBuffer;
     /**
      * Fila de resolvers pendentes de `waitForSlot`.
      * Cada entry é resolvida quando um slot de concorrência libera (ou em stop()).
