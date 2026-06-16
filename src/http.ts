@@ -1,17 +1,22 @@
 import { RatatoskrError } from './errors.js';
 import type { ClientOptions } from './types.js';
 
-/** Combina dois AbortSignals sem depender de AbortSignal.any() (Node 20+). */
-function combineSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+/**
+ * Combina dois AbortSignals sem depender de AbortSignal.any() (Node 20+).
+ * Retorna o signal combinado e uma função de cleanup que remove os listeners
+ * de `b` (o signal de longa vida do Worker) quando o request terminar.
+ */
+function combineSignals(a: AbortSignal, b: AbortSignal): [AbortSignal, () => void] {
   const controller = new AbortController();
   if (a.aborted || b.aborted) {
     controller.abort();
-    return controller.signal;
+    return [controller.signal, () => {}];
   }
   const abort = () => controller.abort();
   a.addEventListener('abort', abort, { once: true });
   b.addEventListener('abort', abort, { once: true });
-  return controller.signal;
+  // Só `b` é de longa vida (abortController do Worker); `a` é descartado após o request.
+  return [controller.signal, () => b.removeEventListener('abort', abort)];
 }
 
 export class HttpClient {
@@ -37,9 +42,9 @@ export class HttpClient {
 
     // Combina o signal externo (ex: stop()) com o timeout interno.
     // Não usamos AbortSignal.any() pois ele só existe no Node >= 20.
-    const combined = signal
+    const [combined, cleanupSignal] = signal
       ? combineSignals(timeoutController.signal, signal)
-      : timeoutController.signal;
+      : [timeoutController.signal, () => {}];
 
     try {
       const res = await fetch(`${this.baseUrl}${path}`, {
@@ -71,6 +76,7 @@ export class HttpClient {
       return data as T;
     } finally {
       clearTimeout(timeoutId);
+      cleanupSignal();
     }
   }
 

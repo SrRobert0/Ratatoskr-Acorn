@@ -15,6 +15,12 @@ export class Worker {
   private abortController: AbortController | null = null;
 
   /**
+   * Mensagens recebidas no último poll mas ainda não despachadas por falta de slot.
+   * Drenadas antes de qualquer novo round trip de rede.
+   */
+  private messageBuffer: Message[] = [];
+
+  /**
    * Fila de resolvers pendentes de `waitForSlot`.
    * Cada entry é resolvida quando um slot de concorrência libera (ou em stop()).
    */
@@ -61,6 +67,9 @@ export class Worker {
     if (!this.running) return;
     this.running = false;
 
+    // Descarta mensagens bufferizadas (voltam à fila após visibilityTimeout)
+    this.messageBuffer.length = 0;
+
     // Aborta o fetch de long polling em andamento
     this.abortController?.abort();
 
@@ -80,18 +89,22 @@ export class Worker {
     const signal = this.abortController!.signal;
 
     while (this.running) {
-      const available = this.concurrency - this.activeCount;
+      // Drena o buffer antes de qualquer round trip de rede.
+      // Evita poll desnecessário quando o poll anterior já trouxe mensagens extras.
+      while (this.messageBuffer.length > 0 && this.activeCount < this.concurrency) {
+        if (!this.running) return;
+        this.activeCount++;
+        void this.dispatch(this.messageBuffer.shift()!);
+      }
 
-      if (available <= 0) {
-        // Todos os slots ocupados: aguarda até algum dispatch terminar.
-        // Usa .catch(() => {}) para absorver o resolve() vindo de stop().
+      if (this.activeCount >= this.concurrency) {
         await this.waitForSlot().catch(() => {});
         continue;
       }
 
-      const maxMessages = Math.min(available, this.maxNumberOfMessages);
+      // Buffer vazio e slots livres: busca mais mensagens na API.
       const qs = new URLSearchParams({
-        maxNumberOfMessages: String(maxMessages),
+        maxNumberOfMessages: String(this.maxNumberOfMessages),
         waitTimeSeconds: String(this.waitTimeSeconds),
       });
 
@@ -103,8 +116,13 @@ export class Worker {
 
         for (const msg of messages) {
           if (!this.running) break;
-          this.activeCount++;
-          void this.dispatch(msg);
+          if (this.activeCount < this.concurrency) {
+            this.activeCount++;
+            void this.dispatch(msg);
+          } else {
+            // Slot ocupado: guarda para despachar quando um slot abrir.
+            this.messageBuffer.push(msg);
+          }
         }
       } catch (err: unknown) {
         // AbortError esperado quando stop() ou timeout acionam o signal
